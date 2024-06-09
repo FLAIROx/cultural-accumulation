@@ -7,10 +7,10 @@ import chex
 from functools import partial
 from flax import struct
 from enum import IntEnum
-from multi_agent_env import MultiAgentEnv
+from env.multi_agent_env import MultiAgentEnv
 from gymnax.environments.spaces import Box, Discrete
 import numpy as np
-from common import (
+from env.common import (
     OBJECT_TO_INDEX,
     COLOR_TO_INDEX,
     DIR_TO_VEC,

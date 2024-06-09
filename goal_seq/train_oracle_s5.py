@@ -10,7 +10,7 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
-from env.gymnax_wrappers import LogWrapperWithDemos
+from env.gymnax_wrappers import LogWrapper
 from env.oracle_env import GoalSequence
 import wandb
 from s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel
@@ -134,7 +134,7 @@ def make_train(config):
     )
 
     env = GoalSequence()
-    env = LogWrapperWithDemos(env)
+    env = LogWrapper(env)
 
     config["CONTINUOUS"] = False
 
@@ -149,7 +149,7 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         init_x = (jnp.zeros((1, config["NUM_ENVS"], *env.observation_space('agent_0').shape)),
                   jnp.zeros((1, config["NUM_ENVS"], 4)), jnp.zeros((1, config["NUM_ENVS"])),
-                  jnp.zeros((1, config["NUM_ENVS"], 10)), jnp.zeros((1, config["NUM_ENVS"], 3)))
+                  jnp.zeros((1, config["NUM_ENVS"], 4)), jnp.zeros((1, config["NUM_ENVS"], 3)))
         init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
         network_params = network.init(_rng, init_hstate, init_x)
         rng, _rng = jax.random.split(rng)
@@ -172,7 +172,7 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, 0)
 
         init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
 
@@ -213,7 +213,7 @@ def make_train(config):
                     rng_step, env_state, actions, penalty, prob_obs
                 )
                 transition = Transition(done, actions, value, reward, log_prob, last_obs, info)
-                hstates = jnp.array([hstate, hstate_1])
+                hstates = jnp.array([hstate])
                 runner_state = (train_state, env_state, obsv, done, hstates, rng, count)
 
                 return runner_state, transition
@@ -336,7 +336,7 @@ def make_train(config):
             return runner_state, (metric, loss_info)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstate,
+        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), jnp.array([init_hstate]),
                         _rng, 0)
         runner_state, (metric, loss_info) = jax.lax.scan(_update_step, runner_state, None, config["NUM_UPDATES"])
         return runner_state, metric, loss_info
@@ -366,11 +366,11 @@ if __name__ == "__main__":
         "FIRST": False
     }
 
-    wandb.init(
-        project='culture',
-        tags=['oracle_training', 'goal_sequence']
-    )
-    wandb.config = config
+    # wandb.init(
+    #     project='culture',
+    #     tags=['oracle_training', 'goal_sequence']
+    # )
+    # wandb.config = config
 
     gpus = jax.devices('gpu')
     rng = jax.random.PRNGKey(42)

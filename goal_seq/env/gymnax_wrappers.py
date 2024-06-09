@@ -37,10 +37,9 @@ class FlattenObservation(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey, seq: chex.Array
+            self, key: chex.PRNGKey, params: Optional[environment.EnvParams] = None
     ) -> Tuple[chex.Array, environment.EnvState]:
-        obs, state = self._env.reset(key, seq)
-        # obs, state = self._env.reset(key)
+        obs, state = self._env.reset(key)
         obs = jnp.reshape(obs, (-1,))
         return obs, state
 
@@ -88,6 +87,17 @@ class LogEnvState:
     episode_lengths: int
     returned_episode_returns: float
     returned_episode_lengths: int
+
+
+class GymnaxWrapper(object):
+    """Base class for Gymnax wrappers."""
+
+    def __init__(self, env):
+        self._env = env
+
+    # provide proxy access to regular attributes of wrapped object
+    def __getattr__(self, name):
+        return getattr(self._env, name)
 
 
 class LogWrapperWithDemosComp(GymnaxWrapper):
@@ -149,10 +159,9 @@ class LogWrapperWithDemos(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey, seq: chex.Array
+            self, key: chex.PRNGKey, trial: int
     ) -> Tuple[chex.Array, environment.EnvState]:
-        obs, env_state = self._env.reset(key, seq) 
-        # obs, env_state = self._env.reset(key)
+        obs, env_state = self._env.reset(key, trial)
         state = LogEnvStateWithDemos(env_state, 0, 0, 0, 0, 0, 0)
         return obs, state
 
@@ -170,9 +179,9 @@ class LogWrapperWithDemos(GymnaxWrapper):
         obs, env_state, reward, done, info = self._env.step(key, state.env_state, action, penalty, prob_obs)
         # print(reward.squeeze())
         new_episode_return = state.episode_returns + reward[0].squeeze()
-        # mean_demo_return = jnp.mean(reward[1:])
-        # new_episode_return_demo = state.episode_returns_demo + mean_demo_return.squeeze()
-        new_episode_return_demo = state.episode_returns_demo + reward[1].squeeze()
+        mean_demo_return = jnp.mean(reward[1:])
+        new_episode_return_demo = state.episode_returns_demo + mean_demo_return.squeeze()
+        # new_episode_return_demo = state.episode_returns_demo + reward[1].squeeze()
         new_episode_length = state.episode_lengths + 1
         state = LogEnvStateWithDemos(
             env_state=env_state,
@@ -198,9 +207,9 @@ class LogWrapper(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(
-            self, key: chex.PRNGKey, params: Optional[environment.EnvParams] = None
+            self, key: chex.PRNGKey, trial: int
     ) -> Tuple[chex.Array, environment.EnvState]:
-        obs, env_state = self._env.reset(key)
+        obs, env_state = self._env.reset(key, trial)
         state = LogEnvState(env_state, 0, 0, 0, 0)
         return obs, state
 
@@ -212,9 +221,10 @@ class LogWrapper(GymnaxWrapper):
             # action: Union[int, float],
             action: chex.Array,
             penalty: float,
+            prob_obs: float,
             params: Optional[environment.EnvParams] = None,
     ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
-        obs, env_state, reward, done, info = self._env.step(key, state.env_state, action, penalty)
+        obs, env_state, reward, done, info = self._env.step(key, state.env_state, action, penalty, prob_obs)
         # print(reward.squeeze())
         new_episode_return = state.episode_returns + reward.squeeze()
         new_episode_length = state.episode_lengths + 1
@@ -229,25 +239,3 @@ class LogWrapper(GymnaxWrapper):
         info["returned_episode_lengths"] = state.returned_episode_lengths
         info["returned_episode"] = done
         return obs, state, reward, done, info
-    
-class TransformObservation(GymnaxWrapper):
-    def __init__(self, env, transform_obs):
-        super().__init__(env)
-        self.transform_obs = transform_obs
-
-    def reset(self, key, params=None):
-        obs, state = self._env.reset(key, params)
-        return self.transform_obs(obs), state
-
-    def step(self, key, state, action, params=None):
-        obs, state, reward, done, info = self._env.step(key, state, action, params)
-        return self.transform_obs(obs), state, reward, done, info
-    
-class TransformReward(GymnaxWrapper):
-    def __init__(self, env, transform_reward):
-        super().__init__(env)
-        self.transform_reward = transform_reward
-
-    def step(self, key, state, action, params=None):
-        obs, state, reward, done, info = self._env.step(key, state, action, params)
-        return obs, state, self.transform_reward(reward), done, info
