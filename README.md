@@ -10,7 +10,7 @@ To run these experiments, simply open the Jupyter notebook __tsp.ipynb__ and ste
 
 ## Goal Sequence Experiments
 ### In-Context Accumulation
-- To train an oracle, run __goal_seq/train_single_s5.py__.
+- To train an oracle, run __goal_seq/train_oracle_s5.py__.
 - To train a social learner, run __goal_seq/train_social_s5.py__.
 - To evaluate in-context accumulation, run __goal_seq/in_context_accumulation.py__.
 
