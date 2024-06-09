@@ -3,16 +3,16 @@
 Code for replicating experiments run in [Artificial Generational Intelligence: Cultural Accumulation in Reinforcement Learning](https://arxiv.org/pdf/2406.00392).
 
 ## Memory Sequence Experiments
-To run these experiments, simply open the Jupyter notebook 'memory_sequence.ipynb' and step through the cells.
+To run these experiments, simply open the Jupyter notebook __memory_sequence.ipynb__ and step through the cells.
 
 ## TSP Experiments
-To run these experiments, simply open the Jupyter notebook 'tsp.ipynb' and step through the cells.
+To run these experiments, simply open the Jupyter notebook __tsp.ipynb__ and step through the cells.
 
 ## Goal Sequence Experiments
 ### In-Context Accumulation
-- To train an oracle, run 'goal_seq/train_single_s5.py'.
-- To train a social learner, run 'goal_seq/train_social_s5.py'.
-- To evaluate in-context accumulation, run 'goal_seq/in_context_accumulation.py'.
+- To train an oracle, run __goal_seq/train_single_s5.py__.
+- To train a social learner, run __goal_seq/train_social_s5.py__.
+- To evaluate in-context accumulation, run __goal_seq/in_context_accumulation.py__.
 
 ### In-Weights Accumulation
-For this experiment, run 'goal_seq/in_weights_accumulation.py'.
+For this experiment, run __goal_seq/in_weights_accumulation.py__.
