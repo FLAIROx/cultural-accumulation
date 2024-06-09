@@ -22,11 +22,9 @@ import gymnax
 from environments.gymnax_wrappers import LogWrapperWithDemos, FlattenObservation
 import functools
 from gymnax.environments import spaces
-from environments.minimal_env import GoalCycle
+from goalseq_env import GoalSequence
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from celluloid import Camera
-from environments.grid_viz import GridVisualizer
 import wandb
 from networks import ActorCriticRNN, ScannedRNN, StatePredictorSmall
 from s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel
@@ -205,7 +203,7 @@ config = {
 }
 
 rng = jax.random.PRNGKey(5)
-env = GoalCycle()
+env = GoalSequence()
 env_params = env.params
 
 init_state = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)

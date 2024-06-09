@@ -1,79 +1,89 @@
-import sys
-import os
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import orbax.checkpoint
-import flax
 from flax.training import orbax_utils
 from flax import struct, core
 import numpy as np
 import optax
-import time
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
+from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
-import gymnax
-# from wrappers import FlattenObservation, LogWrapper, TransformObservation, TransformReward, BraxGymnaxWrapper
-from gymnax_wrappers import LogWrapper, FlattenObservation
-import functools
-from gymnax.environments import spaces
-from goal_cycle import GoalCycle
-import matplotlib.pyplot as plt
-from celluloid import Camera
-from grid_viz import GridVisualizer
+from environments.gymnax_wrappers import LogWrapperWithDemos
+from in_context_env import GoalSequence
+import wandb
+from s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel
 
 
-class ScannedRNN(nn.Module):
+d_model = 256
+ssm_size = 256
+C_init = "lecun_normal"
+discretization="zoh"
+dt_min=0.001
+dt_max=0.1
+n_layers = 4
+conj_sym=True
+clip_eigs=False
+bidirectional=False
 
-    @functools.partial(
-        nn.scan,
-        variable_broadcast='params',
-        in_axes=0,
-        out_axes=0,
-        split_rngs={'params': False})
-    @nn.compact
-    def __call__(self, carry, x):
-        """Applies the module."""
-        # c, h = carry
-        rnn_state = carry
-        ins, resets = x
-        rnn_state = jnp.where(resets[:, np.newaxis], self.initialize_carry(ins.shape[0], ins.shape[1]), rnn_state)
-        new_rnn_state, y = nn.GRUCell()(rnn_state, ins)
-        return new_rnn_state, y
+blocks = 1
+block_size = int(ssm_size / blocks)
 
-    @staticmethod
-    def initialize_carry(batch_size, hidden_size):
-        return nn.GRUCell.initialize_carry(
-            jax.random.PRNGKey(0), (batch_size,), hidden_size)
+Lambda, _, B, V, B_orig = make_DPLR_HiPPO(ssm_size)
+
+block_size = block_size // 2
+ssm_size = ssm_size // 2
+
+Lambda = Lambda[:block_size]
+V = V[:, :block_size]
+
+Vinv = V.conj().T
+
+ssm_init_fn = init_S5SSM(H=d_model,
+                            P=ssm_size,
+                            Lambda_re_init=Lambda.real,
+                            Lambda_im_init=Lambda.imag,
+                            V=V,
+                            Vinv=Vinv,
+                            C_init=C_init,
+                            discretization=discretization,
+                            dt_min=dt_min,
+                            dt_max=dt_max,
+                            conj_sym=conj_sym,
+                            clip_eigs=clip_eigs,
+                            bidirectional=bidirectional)
 
 
-class ActorCriticRNN(nn.Module):
+class ActorCriticS5(nn.Module):
     action_dim: Sequence[int]
     config: Dict
 
     @nn.compact
     def __call__(self, hidden, x):
-        obs, dir, dones = x
-        embedding = nn.Conv(32, kernel_size=(3, 3), strides=3,
+        obs, dir, dones, trial, reward = x
+        embedding = nn.Conv(32, kernel_size=(1, 1), strides=1, padding=0,
                             kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(obs)
         embedding = nn.leaky_relu(embedding)
-        embedding = nn.Conv(64, kernel_size=(3, 3), strides=1,
+        embedding = nn.Conv(64, kernel_size=(1, 1), strides=1, padding=0,
                             kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(embedding)
         embedding = nn.leaky_relu(embedding)
-        embedding = nn.Conv(64, kernel_size=(3, 3), strides=1,
+        embedding = nn.Conv(64, kernel_size=(1, 1), strides=1, padding=0,
                             kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(embedding)
         embedding = nn.leaky_relu(embedding)
 
         embedding = embedding.reshape(embedding.shape[0], embedding.shape[1], -1)
 
-        embedding = jnp.concatenate([embedding, dir], -1)
+        embedding = jnp.concatenate([embedding, dir, trial, reward], -1)
         embedding = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(embedding)
         embedding = nn.tanh(embedding)
 
-        rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        hidden, embedding = StackedEncoderModel(
+            ssm=ssm_init_fn,
+            d_model=d_model,
+            n_layers=n_layers,
+            activation="half_glu1",
+        )(hidden, embedding, dones)
 
         actor_mean = nn.Dense(64, kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
         actor_mean = nn.tanh(actor_mean)
@@ -96,30 +106,9 @@ class ActorCriticRNN(nn.Module):
         return hidden, pi, jnp.squeeze(critic, axis=-1), embedding
 
 
-class StatePredictor(nn.Module):
-
-    @nn.compact
-    def __call__(self, x):
-        embedding = nn.Dense(576, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        embedding = nn.tanh(embedding)
-        embedding = embedding.reshape(embedding.shape[0], embedding.shape[1], 3, 3, -1)
-
-        embedding = nn.ConvTranspose(64, kernel_size=(3, 3), strides=[1, 1],
-                                     kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(embedding)
-        embedding = nn.leaky_relu(embedding)
-        embedding = nn.ConvTranspose(32, kernel_size=(3, 3), strides=[1, 1],
-                                     kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(embedding)
-        embedding = nn.leaky_relu(embedding)
-        state_pred = nn.ConvTranspose(3, kernel_size=(3, 3), strides=[3, 3], padding=1,
-                                     kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(embedding)
-
-        return state_pred
-
-
 @struct.dataclass
 class AgentParams:
     ac_params: core.FrozenDict
-    aux_params: core.FrozenDict
 
 
 class Transition(NamedTuple):
@@ -144,9 +133,8 @@ def make_train(config):
             config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
 
-    env = GoalCycle()
-    env_params = env.params
-    env = LogWrapper(env)
+    env = GoalSequence()
+    env = LogWrapperWithDemos(env)
 
     config["CONTINUOUS"] = False
 
@@ -157,24 +145,16 @@ def make_train(config):
     def train(rng):
 
         # INIT NETWORK
-        if config["CONTINUOUS"]:
-            network = ActorCriticRNN(env.action_space('agent_0').shape[0], config=config)
-        else:
-            network = ActorCriticRNN(env.action_space('agent_0').n, config=config)
+        network = ActorCriticS5(env.action_space('agent_0').n, config=config)
+        oracle_net = ActorCriticS5(env.action_space('agent_1').n, config=config)
         rng, _rng = jax.random.split(rng)
         init_x = (jnp.zeros((1, config["NUM_ENVS"], *env.observation_space('agent_0').shape)),
-                  jnp.zeros((1, config["NUM_ENVS"], 4)), jnp.zeros((1, config["NUM_ENVS"])))
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], 256)
-        # network_params = network.init(_rng, init_hstate, init_x)
-        # network_params = learner_state['params']['ac_params']
-        network_params = demo_state['params']['ac_params']
-        model = StatePredictor()
-        if config['NUM_DEMOS'] != 0:
-            demo_nets = {}
-            demo_params = {}
-            for i in range(config['NUM_DEMOS']):
-                demo_nets['agent_'+str(i+1)] = ActorCriticRNN(env.action_space('agent_0').n, config=config)
-                demo_params['agent_'+str(i+1)] = demo_states[i]['params']['ac_params']
+                  jnp.zeros((1, config["NUM_ENVS"], 4)), jnp.zeros((1, config["NUM_ENVS"])),
+                  jnp.zeros((1, config["NUM_ENVS"], 10)), jnp.zeros((1, config["NUM_ENVS"], 3)))
+        init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
+        network_params = network.init(_rng, init_hstate, init_x)
+        oracle_params = oracle_params_ckpt
+
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -182,109 +162,84 @@ def make_train(config):
             )
         else:
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
-        _, _, _, init_embedding = network.apply(network_params, init_hstate, init_x)
-        init_action = jnp.zeros((1, config["NUM_ENVS"], 3))  # *env.action_space(env_params).shape))
-        init_s = jnp.concatenate((init_embedding, init_action), axis=2)
+
         train_state = TrainState.create(
             apply_fn=None,
             params=AgentParams(
                 network_params,
-                # model.init(_rng, init_s)
-                demo_state['params']['aux_params']
-                # learner_state['params']['aux_params']
             ),
             tx=tx,
         )
 
-        # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
 
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], 256)
-        init_hstate_d = jnp.array(
-            [ScannedRNN.initialize_carry(config["NUM_ENVS"], 256) for i in range(config['NUM_DEMOS'])])
+        init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
 
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, hstate_d, rng, count = runner_state
+                train_state, env_state, last_obs, last_done, hstates, rng, count = runner_state
                 count += 1
                 rng, _rng = jax.random.split(rng)
+
+                hstate, hstate_1 = hstates
 
                 # SELECT ACTION
                 ac_in = (last_obs['agent_0']['image'][np.newaxis, :],
                          last_obs['agent_0']['agent_dir'][np.newaxis, :],
-                         last_done[np.newaxis, :])
+                         last_done[np.newaxis, :],
+                         last_obs['agent_0']['trial'][np.newaxis, :],
+                         last_obs['agent_0']['reward'][np.newaxis, :])
 
-                hstate, pi, value, embedding = network.apply(train_state.params.ac_params, hstate, ac_in)
-                hs = jnp.repeat(jnp.zeros_like(hstate[jnp.newaxis, :, :]), config['NUM_DEMOS'], axis=0)
-                values = jnp.repeat(jnp.zeros_like(value), config['NUM_DEMOS'], axis=0)
-                keys = list(last_obs.keys())[1:]
+                in_1 = (last_obs['agent_1']['image'][np.newaxis, :],
+                        last_obs['agent_1']['agent_dir'][np.newaxis, :],
+                        last_done[np.newaxis, :],
+                        last_obs['agent_1']['trial_4'][np.newaxis, :],
+                        last_obs['agent_1']['reward'][np.newaxis, :])
 
-                def _get_demo_inputs(idx, carry):
-                    hs, values, actions, hstate_d = carry
-                    key = 'agent_1'
-                    # key = keys.at[idx].get()
-                    demonstrator = demo_nets[key]
-                    ac_in_d = (last_obs[key]['image'][np.newaxis, :],
-                             last_obs[key]['agent_dir'][np.newaxis, :],
-                             last_done[np.newaxis, :])
-                    h = hstate_d.at[idx].get()
-                    hstate_d, pi_d, value_d, embedding_d = demonstrator.apply(demo_params[key], h, ac_in_d)
-                    hs = hs.at[idx].set(h)
-                    values = values.at[idx].set(value_d.squeeze(0))
-                    action_d = pi_d.sample(seed=_rng).squeeze(0)
-                    actions = actions.at[idx].set(action_d)
-                    hstate_d = hstate_d[jnp.newaxis, :, :]
-                    return (hs, values, actions, hstate_d)
+                hstate, pi, value, _ = network.apply(train_state.params.ac_params, hstate, ac_in)
+                hstate_1, pi_1, _, _ = oracle_net.apply(oracle_params[0], hstate_1, in_1)
 
                 action = pi.sample(seed=_rng)
+                rng, _rng = jax.random.split(rng)
+                action_1 = pi_1.sample(seed=_rng).squeeze(0)
                 log_prob = pi.log_prob(action)
-                actions = jnp.repeat(jnp.zeros_like(action), config['NUM_DEMOS'], axis=0)
                 value, action, log_prob = value.squeeze(0), action.squeeze(0), log_prob.squeeze(0)
-                # hs, values, actions, hstate_d = jax.lax.fori_loop(0, config['NUM_DEMOS'], _get_demo_inputs,
-                #                                              (hs, values, actions, hstate_d))
+                actions = jnp.array([action, action_1]).transpose()
 
-                # STEP ENV
-                # actions = jnp.insert(actions, 0, action, axis=0).transpose()
-                actions = jnp.array([action]).transpose()
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                # penalty = 0.5 + ((count > (config["TOTAL_TIMESTEPS"] // 5)) * 0.5)
-                penalty = 1.5
+                frac = (train_state.step // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+                        ) / (config["NUM_UPDATES"])
+                prob_obs = 1 - frac
+                penalty = 1.0
+                prob_obs = jax.lax.select(config['FIRST'], 0.0, prob_obs)
                 penalty = jnp.repeat(penalty, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, 0))(
-                    rng_step, env_state, actions, penalty
+                prob_obs = jnp.repeat(prob_obs, config["NUM_ENVS"])
+                obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, 0, 0))(
+                    rng_step, env_state, actions, penalty, prob_obs
                 )
                 transition = Transition(done, actions, value, reward, log_prob, last_obs, info)
-                runner_state = (train_state, env_state, obsv, done, hstate, hstate_d, rng, count)
-
-                # rendering
-                # img = viz.render(env_params, env_state.env_state, 0)
-                # imshow_obj = ax.imshow(img, interpolation='bilinear')
-                # imshow_obj.set_data(img)
-                # ax.text(0.5, 1.1, 'Reward: ' + str(reward[0]))
-                # fig.canvas.draw()
-                # camera.snap()
+                hstates = jnp.array([hstate, hstate_1])
+                runner_state = (train_state, env_state, obsv, done, hstates, rng, count)
 
                 return runner_state, transition
 
-            initial_hstate = runner_state[-4]
-            # viz = GridVisualizer()
-            # fig, ax = plt.subplots()
-            # camera = Camera(fig)
+            initial_hstate = runner_state[-3]
             runner_state, traj_batch = jax.lax.scan(_env_step, runner_state, None, config["NUM_STEPS"])
-            # animation = camera.animate()
-            # animation.save('animations/first_full_exp.gif')
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, hstate_d, rng, count = runner_state
+            train_state, env_state, last_obs, last_done, hstates, rng, count = runner_state
             ac_in = (last_obs['agent_0']['image'][np.newaxis, :],
                      last_obs['agent_0']['agent_dir'][np.newaxis, :],
-                     last_done[np.newaxis, :])
+                     last_done[np.newaxis, :],
+                     last_obs['agent_0']['trial'][np.newaxis, :],
+                     last_obs['agent_0']['reward'][np.newaxis, :])
+            hstate = hstates[0]
             _, _, last_val, _ = network.apply(train_state.params.ac_params, hstate, ac_in)
             last_val = last_val.squeeze(0)
             last_val = jnp.where(last_done, jnp.zeros_like(last_val), last_val)
@@ -314,14 +269,18 @@ def make_train(config):
                                  traj_batch.obs['agent_0']['agent_dir'].reshape(
                                      traj_batch.obs['agent_0']['agent_dir'].shape[0],
                                      traj_batch.obs['agent_0']['agent_dir'].shape[1], -1),
-                                 traj_batch.done)
-                        _, pi, value, embedding = network.apply(params.ac_params, init_hstate[0], ac_in)
+                                 traj_batch.done,
+                                 traj_batch.obs['agent_0']['trial'].reshape(
+                                     traj_batch.obs['agent_0']['trial'].shape[0],
+                                     traj_batch.obs['agent_0']['trial'].shape[1], -1),
+                                 traj_batch.obs['agent_0']['reward'].reshape(
+                                     traj_batch.obs['agent_0']['reward'].shape[0],
+                                     traj_batch.obs['agent_0']['reward'].shape[1], -1)
+                                 )
+                        _, pi, value, _ = network.apply(params.ac_params, init_hstate, ac_in)
                         action = traj_batch.action[:, :, 0]
-                        action_onehot = jax.nn.one_hot(action, 3)
-                        log_prob = pi.log_prob(traj_batch.action[:, :, 0])
 
-                        state_pred = model.apply(
-                            params.aux_params, jnp.concatenate((embedding, action_onehot), 2))
+                        log_prob = pi.log_prob(action)
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(-config["CLIP_EPS"],
@@ -339,24 +298,8 @@ def make_train(config):
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
-                        # CALCULATE AUXILIARY LOSS
-                        # state_target = jnp.roll(traj_batch.obs['agent_0']['image'], -1, axis=0)
-                        state_target = traj_batch.obs['agent_0']['image']
-
-                        # def callback(state_pred, state_target):
-                        #     plt.imshow(state_pred[100][5])
-                        #     plt.savefig('aux_task/pred_recon_5')
-                        #     plt.imshow(state_target[100][5])
-                        #     plt.savefig('aux_task/target_recon_5')
-                        #
-                        # jax.debug.callback(callback, state_pred, state_target)
-
-                        state_losses = jnp.abs(state_target[:-1] - state_pred[:-1])
-                        aux_loss = state_losses.mean()
-
-                        total_loss = loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy + \
-                            aux_loss * config["AUX_COEF"]
-                        return total_loss, (value_loss, loss_actor, entropy, aux_loss)
+                        total_loss = loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy 
+                        return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(train_state.params, init_hstate, traj_batch, advantages, targets)
@@ -384,34 +327,30 @@ def make_train(config):
                 update_state = (train_state, init_hstate, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
-            init_hstate = initial_hstate[None, :]  # TBH
+            init_hstate = initial_hstate[0]  
+            init_hstate = [i for i in init_hstate]
             update_state = (train_state, init_hstate, traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config["UPDATE_EPOCHS"])
-            # commented out line below as this is an eval script
-            # train_state = update_state[0]
+            train_state = update_state[0]
 
             metric = traj_batch.info
             rng = update_state[-1]
 
             if config["DEBUG"]:
-                if config["LOG"] == "aux":
-                    def callback(loss_info):
-                        print(loss_info[1][-1].mean())
+                def callback(metric, loss_info):
+                    print(metric["returned_episode_returns"][-1, :].mean())
+                    wandb.log({'Mean Return': metric["returned_episode_returns"][-1, :].mean()})
+                    wandb.log({'Mean Oracle Return': metric["returned_episode_returns_oracle"][-1, :].mean()})
 
-                    jax.debug.callback(callback, loss_info)
+                jax.debug.callback(callback, traj_batch.info, loss_info)
 
-                else:
-                    def callback(metric):
-                        print(metric["returned_episode_returns"][-1, :].mean())
-
-                    jax.debug.callback(callback, traj_batch.info)
-
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, hstate_d, rng, count)
+            runner_state = (train_state, env_state, last_obs, last_done, hstates, rng, count)
             return runner_state, (metric, loss_info)
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstate,
-                        init_hstate_d, _rng, 0)
+        init_hstates = jnp.array([init_hstate for i in range(1 + config['NUM_ORACLES'])])
+        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstates,
+                        _rng, 0)
         runner_state, (metric, loss_info) = jax.lax.scan(_update_step, runner_state, None, config["NUM_UPDATES"])
         return runner_state, metric, loss_info
 
@@ -419,37 +358,55 @@ def make_train(config):
 
 
 if __name__ == "__main__":
-    # with jax.disable_jit():
     config = {
-        "LR": 1e-4,
-        "NUM_ENVS": 8,
-        "NUM_STEPS": 128,
-        "TOTAL_TIMESTEPS": 1.25e8,
-        # "TOTAL_TIMESTEPS": 1e3,
+        "LR": 1e-5,
+        "NUM_ENVS": 128,
+        "NUM_STEPS": 32,
+        "TOTAL_TIMESTEPS": 1.5e7,
         "UPDATE_EPOCHS": 8,
         "NUM_MINIBATCHES": 8,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
         "ENT_COEF": 0.01,
-        "AUX_COEF": 3,
+        "AUX_COEF": 0,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ENV_NAME": "GoalCycle",
-        "ANNEAL_LR": True,
+        "ANNEAL_LR": False,
         "DEBUG": True,
-        "NUM_DEMOS": 0,
-        "LOG": "metric"
+        "NUM_ORACLES": 1,
+        "LOG": "metric",
+        "FIRST": False
     }
 
-    # INIT DEMONSTRATOR
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    # learner_state = orbax_checkpointer.restore('tmp/orbax/social/recon_social_learner')#['model']
-    demo_state = orbax_checkpointer.restore('tmp/orbax/experts/stage_5/curriculum_1e8_0')#['model']
-    demo_states = [demo_state]
+    wandb.init(
+        project='culture',
+        tags=['social_training', 'goal_sequence']
+    )
+    wandb.config = config
 
+    # INIT ORACLE
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    checkpoint_loc = 'tmp/orbax/oracle'
+    oracle_state = orbax_checkpointer.restore(checkpoint_loc)['params']['ac_params']
+    oracle_params_ckpt = [oracle_state]
+
+    gpus = jax.devices('gpu')
     rng = jax.random.PRNGKey(42)
-    train_jit = jax.jit(make_train(config))
-    out, metric, loss_info = train_jit(rng)
+    rngs = jax.random.split(rng, len(gpus))
+    train_jit = jax.pmap(make_train(config), devices=gpus)
+    out, metric, loss_info = train_jit(rngs)
     train_state = out[0]
-    jnp.save("results.npy", metric["returned_episode_returns"].mean(-1).reshape(-1))
+
+    results = jnp.array([metric["returned_episode_returns"][i].mean(-1).reshape(-1) for i in range(2)])
+    best_idx = jnp.argmax(jnp.mean(results[:, -1000:], axis=1))
+    results = metric["returned_episode_returns"][best_idx].mean(-1).reshape(-1)
+
+    model_config = {'name': 'AC-GRU'}
+    # save social checkpoint
+    best_model = jax.tree_util.tree_map(lambda x: x[best_idx], train_state)
+    save_args = orbax_utils.save_args_from_target(best_model)
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_loc = 'tmp/orbax/social'
+    orbax_checkpointer.save(save_loc, best_model, save_args=save_args)

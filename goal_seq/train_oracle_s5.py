@@ -10,8 +10,8 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
-from environments.gymnax_wrappers import LogWrapperWithDemos
-from in_context_env_train import GoalSequence
+from env.gymnax_wrappers import LogWrapperWithDemos
+from env.oracle_env import GoalSequence
 import wandb
 from s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel
 
@@ -146,14 +146,13 @@ def make_train(config):
 
         # INIT NETWORK
         network = ActorCriticS5(env.action_space('agent_0').n, config=config)
-        oracle_net = ActorCriticS5(env.action_space('agent_1').n, config=config)
         rng, _rng = jax.random.split(rng)
         init_x = (jnp.zeros((1, config["NUM_ENVS"], *env.observation_space('agent_0').shape)),
                   jnp.zeros((1, config["NUM_ENVS"], 4)), jnp.zeros((1, config["NUM_ENVS"])),
                   jnp.zeros((1, config["NUM_ENVS"], 10)), jnp.zeros((1, config["NUM_ENVS"], 3)))
         init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
         network_params = network.init(_rng, init_hstate, init_x)
-        oracle_params = oracle_params_ckpt
+        rng, _rng = jax.random.split(rng)
 
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -182,11 +181,9 @@ def make_train(config):
 
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstates, rng, count = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, count = runner_state
                 count += 1
                 rng, _rng = jax.random.split(rng)
-
-                hstate, hstate_1 = hstates
 
                 # SELECT ACTION
                 ac_in = (last_obs['agent_0']['image'][np.newaxis, :],
@@ -195,21 +192,13 @@ def make_train(config):
                          last_obs['agent_0']['trial'][np.newaxis, :],
                          last_obs['agent_0']['reward'][np.newaxis, :])
 
-                in_1 = (last_obs['agent_1']['image'][np.newaxis, :],
-                        last_obs['agent_1']['agent_dir'][np.newaxis, :],
-                        last_done[np.newaxis, :],
-                        last_obs['agent_1']['trial_4'][np.newaxis, :],
-                        last_obs['agent_1']['reward'][np.newaxis, :])
-
                 hstate, pi, value, _ = network.apply(train_state.params.ac_params, hstate, ac_in)
-                hstate_1, pi_1, _, _ = oracle_net.apply(oracle_params[0], hstate_1, in_1)
 
                 action = pi.sample(seed=_rng)
                 rng, _rng = jax.random.split(rng)
-                action_1 = pi_1.sample(seed=_rng).squeeze(0)
                 log_prob = pi.log_prob(action)
                 value, action, log_prob = value.squeeze(0), action.squeeze(0), log_prob.squeeze(0)
-                actions = jnp.array([action, action_1]).transpose()
+                actions = jnp.array([action]).transpose()
 
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
@@ -340,7 +329,6 @@ def make_train(config):
                 def callback(metric, loss_info):
                     print(metric["returned_episode_returns"][-1, :].mean())
                     wandb.log({'Mean Return': metric["returned_episode_returns"][-1, :].mean()})
-                    wandb.log({'Mean Oracle Return': metric["returned_episode_returns_oracle"][-1, :].mean()})
 
                 jax.debug.callback(callback, traj_batch.info, loss_info)
 
@@ -348,8 +336,7 @@ def make_train(config):
             return runner_state, (metric, loss_info)
 
         rng, _rng = jax.random.split(rng)
-        init_hstates = jnp.array([init_hstate for i in range(1 + config['NUM_ORACLES'])])
-        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstates,
+        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstate,
                         _rng, 0)
         runner_state, (metric, loss_info) = jax.lax.scan(_update_step, runner_state, None, config["NUM_UPDATES"])
         return runner_state, metric, loss_info
@@ -375,22 +362,15 @@ if __name__ == "__main__":
         "ENV_NAME": "GoalCycle",
         "ANNEAL_LR": False,
         "DEBUG": True,
-        "NUM_ORACLES": 1,
         "LOG": "metric",
         "FIRST": False
     }
 
     wandb.init(
         project='culture',
-        tags=['social_training', 'goal_sequence']
+        tags=['oracle_training', 'goal_sequence']
     )
     wandb.config = config
-
-    # INIT ORACLE
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    checkpoint_loc = 'tmp/orbax/oracle'
-    oracle_state = orbax_checkpointer.restore(checkpoint_loc)['params']['ac_params']
-    oracle_params_ckpt = [oracle_state]
 
     gpus = jax.devices('gpu')
     rng = jax.random.PRNGKey(42)
@@ -408,5 +388,5 @@ if __name__ == "__main__":
     best_model = jax.tree_util.tree_map(lambda x: x[best_idx], train_state)
     save_args = orbax_utils.save_args_from_target(best_model)
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    save_loc = 'tmp/orbax/social'
+    save_loc = 'tmp/orbax/oracle'
     orbax_checkpointer.save(save_loc, best_model, save_args=save_args)
