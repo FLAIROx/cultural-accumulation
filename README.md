@@ -1,6 +1,6 @@
 # Cultural Accumulation in Reinforcement Learning
 
-Code for replicating experiments run in _Artificial Generational Intelligence: Cultural Accumulation in Reinforcement Learning_.
+Code for replicating experiments run in [_Artificial Generational Intelligence: Cultural Accumulation in Reinforcement Learning_](https://arxiv.org/abs/2406.00392).
 
 ## Memory Sequence Experiments
 To run these experiments, simply open the Jupyter notebook __memory_sequence.ipynb__ and step through the cells.
